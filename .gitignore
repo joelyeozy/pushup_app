@@ -69,3 +69,6 @@ dist/
 build/
 *.h5
 my-model/
+
+
+venv
