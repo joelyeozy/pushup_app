@@ -4,6 +4,8 @@
   "private": true,
   "license": "Apache-2.0",
   "dependencies": {
+    "@google-cloud/text-to-speech": "^3.2.1",
+    "@tensorflow-models/posenet": "^2.2.2",
     "@tensorflow/tfjs": "^1.2.7",
     "bootstrap": "^4.3.1",
     "cors": "^2.8.5",

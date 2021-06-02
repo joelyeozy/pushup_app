@@ -11,12 +11,16 @@ import { MODEL_CLASSES } from '../model/classes';
 import config from '../config';
 import './Classify.css';
 import 'cropperjs/dist/cropper.css';
+import * as posenet from '@tensorflow-models/posenet';
+import { abs, time } from '@tensorflow/tfjs';
 
 
 const MODEL_PATH = '/model/model.json';
-const IMAGE_SIZE = 224;
 const CANVAS_SIZE = 224;
 const TOPK_PREDICTIONS = 5;
+const CONFIDENCE_THRESHOLD = 0.7
+const ANGLE_THRESHOLD = 80
+const STRAIGHTEN_THRESHOLD = 150
 
 const INDEXEDDB_DB = 'tensorflowjs';
 const INDEXEDDB_STORE = 'model_info_store';
@@ -47,12 +51,23 @@ export default class Classify extends Component {
       showModelUpdateSuccess: false,
       isDownloadingModel: false
     };
+    this.pushup_allowed = false;
+    this.pushup_count = 0;
   }
 
   async componentDidMount() {
     if (('indexedDB' in window)) {
       try {
-        this.model = await tf.loadLayersModel('indexeddb://' + INDEXEDDB_KEY);
+        this.model = await posenet.load({
+          architecture: 'ResNet50',
+          outputStride: 32,
+          inputResolution: { width: 257, height: 200  },
+          quantBytes: 2,
+          modelUrl: 'indexeddb://' + INDEXEDDB_KEY
+        })
+        console.log('here')
+        
+        // tf.loadLayersModel('indexeddb://' + INDEXEDDB_KEY);
 
         // Safe to assume tensorflowjs database and related object store exists.
         // Get the date when the model was saved.
@@ -63,7 +78,6 @@ export default class Classify extends Component {
                                .get(INDEXEDDB_KEY);
           const dateSaved = new Date(item.modelArtifactsInfo.dateSaved);
           await this.getModelInfo();
-          console.log(this.modelLastUpdated);
           if (!this.modelLastUpdated  || dateSaved >= new Date(this.modelLastUpdated).getTime()) {
             console.log('Using saved model');
           }
@@ -84,24 +98,35 @@ export default class Classify extends Component {
       // If error here, assume that the object store doesn't exist and the model currently isn't
       // saved in IndexedDB.
       catch (error) {
+        console.log('please look at line 101')
         console.log('Not found in IndexedDB. Loading and saving...');
         console.log(error);
-        this.model = await tf.loadLayersModel(MODEL_PATH);
-        await this.model.save('indexeddb://' + INDEXEDDB_KEY);
+        this.model = await posenet.load({
+          architecture: 'ResNet50',
+          outputStride: 32,
+          inputResolution: { width: 257, height: 200  },
+          quantBytes: 2,
+          // modelUrl: MODEL_PATH
+        });
+        // need to somehow save this to the db
+        // await this.model.save('indexeddb://' + INDEXEDDB_KEY);
       }
     }
     // If no IndexedDB, then just download like normal.
     else {
       console.warn('IndexedDB not supported.');
-      this.model = await tf.loadLayersModel(MODEL_PATH);
+      this.model = await posenet.load({
+        architecture: 'ResNet50',
+        outputStride: 32,
+        inputResolution: { width: 257, height: 200  },
+        quantBytes: 2
+      });
     }
 
     this.setState({ modelLoaded: true });
     this.initWebcam();
 
-    // Warm up model.
-    let prediction = tf.tidy(() => this.model.predict(tf.zeros([1, IMAGE_SIZE, IMAGE_SIZE, 3])));
-    prediction.dispose();
+  
   }
 
   async componentWillUnmount() {
@@ -163,7 +188,12 @@ export default class Classify extends Component {
     // Get the latest model from the server and refresh the one saved in IndexedDB.
     console.log('Updating the model: ' + INDEXEDDB_KEY);
     this.setState({ isDownloadingModel: true });
-    this.model = await tf.loadLayersModel(MODEL_PATH);
+    this.model = await posenet.load({
+      architecture: 'MobileNetV1',
+      outputStride: 16,
+      inputResolution: { width: 640, height: 480 },
+      multiplier: 0.50
+    });
     await this.model.save('indexeddb://' + INDEXEDDB_KEY);
     this.setState({
       isDownloadingModel: false,
@@ -173,104 +203,90 @@ export default class Classify extends Component {
     });
   }
 
-  classifyLocalImage = async () => {
-    this.setState({ isClassifying: true });
-
-    const croppedCanvas = this.refs.cropper.getCroppedCanvas();
-    const image = tf.tidy( () => tf.browser.fromPixels(croppedCanvas).toFloat());
-
-    // Process and resize image before passing in to model.
-    const imageData = await this.processImage(image);
-    const resizedImage = tf.image.resizeBilinear(imageData, [IMAGE_SIZE, IMAGE_SIZE]);
-
-    const logits = this.model.predict(resizedImage);
-    const probabilities = await logits.data();
-    const preds = await this.getTopKClasses(probabilities, TOPK_PREDICTIONS);
-
-    this.setState({
-      predictions: preds,
-      isClassifying: false,
-      photoSettingsOpen: !this.state.photoSettingsOpen
-    });
-
-    // Draw thumbnail to UI.
-    const context = this.refs.canvas.getContext('2d');
-    const ratioX = CANVAS_SIZE / croppedCanvas.width;
-    const ratioY = CANVAS_SIZE / croppedCanvas.height;
-    const ratio = Math.min(ratioX, ratioY);
-    context.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
-    context.drawImage(croppedCanvas, 0, 0,
-                      croppedCanvas.width * ratio, croppedCanvas.height * ratio);
-
-    // Dispose of tensors we are finished with.
-    image.dispose();
-    imageData.dispose();
-    resizedImage.dispose();
-    logits.dispose();
-  }
 
   classifyWebcamImage = async () => {
     this.setState({ isClassifying: true });
+    this.pushup_count = 0;
 
+    // warmup model to reduce wait time, gave 3 second buffer
     const imageCapture = await this.webcam.capture();
+    const pose =  this.model.estimateSinglePose(imageCapture, 0.50, false, 16);
 
-    const resized = tf.image.resizeBilinear(imageCapture, [IMAGE_SIZE, IMAGE_SIZE]);
-    const imageData = await this.processImage(resized);
-    const logits = this.model.predict(imageData);
-    const probabilities = await logits.data();
-    const preds = await this.getTopKClasses(probabilities, TOPK_PREDICTIONS);
+
+    document.getElementById('timer').hidden = false
+    document.getElementById('timer').innerHTML = 'Starting in 3...'
+    await new Promise(resolve => setTimeout(resolve, 1000))
+    document.getElementById('timer').innerHTML = 'Starting in 2...'
+    await new Promise(resolve => setTimeout(resolve, 1000))
+    document.getElementById('timer').innerHTML = 'Starting in 1...'
+    await new Promise(resolve => setTimeout(resolve, 1000))
+
+    var start_time = Date.now()
+    document.getElementById('pushup_count').hidden = false
+    var count = 0
+    while (Date.now() - start_time < 60000)
+    {
+      count += 1
+      console.log(count)
+      const imageCapture = await this.webcam.capture();
+      const pose = await this.model.estimateSinglePose(imageCapture, 0.50, false, 16);
+      if (await this.valid_pushup (pose, 5, 7, 9) || await this.valid_pushup (pose, 6, 8, 10)  )
+      {
+        if (this.pushup_allowed)
+          {
+            this.pushup_count +=1;
+            this.pushup_allowed = false;
+          }
+      }
+      if (Math.floor((60000 - (Date.now() - start_time))/1000) >= 0){
+        document.getElementById('timer').innerHTML = Math.floor((60000 - (Date.now() - start_time))/1000) + ' seconds remaining'
+      }
+      else{
+        document.getElementById('timer').innerHTML = '0 seconds remaining'
+      }
+      document.getElementById('pushup_count').innerHTML = this.pushup_count + ' Pushup(s) counted'
+      if (this.pushup_allowed == false){
+        document.getElementById('straighten_arm').hidden = false
+      }
+      else {
+        document.getElementById('straighten_arm').hidden = true
+      }
+    }
 
     this.setState({
-      predictions: preds,
       isClassifying: false,
-      photoSettingsOpen: !this.state.photoSettingsOpen
     });
-
-    // Draw thumbnail to UI.
-    const tensorData = tf.tidy(() => imageCapture.toFloat().div(255));
-    await tf.browser.toPixels(tensorData, this.refs.canvas);
-
-    // Dispose of tensors we are finished with.
-    resized.dispose();
-    imageCapture.dispose();
-    imageData.dispose();
-    logits.dispose();
-    tensorData.dispose();
+    document.getElementById('pushup_count').innerHTML = this.pushup_count + ' Pushup(s) counted, click to restart'
   }
 
-  processImage = async (image) => {
-    return tf.tidy(() => image.expandDims(0).toFloat().div(127).sub(1));
-  }
 
-  /**
-   * Computes the probabilities of the topK classes given logits by computing
-   * softmax to get probabilities and then sorting the probabilities.
-   * @param logits Tensor representing the logits from MobileNet.
-   * @param topK The number of top predictions to show.
-   */
-  getTopKClasses = async (values, topK) => {
-    const valuesAndIndices = [];
-    for (let i = 0; i < values.length; i++) {
-      valuesAndIndices.push({value: values[i], index: i});
+  valid_pushup = async (pose, shoulder_index, elbow_index, wrist_index) =>{
+    var valid = false
+    if (pose.keypoints[shoulder_index].score > CONFIDENCE_THRESHOLD && pose.keypoints[elbow_index].score > CONFIDENCE_THRESHOLD && pose.keypoints[wrist_index].score > CONFIDENCE_THRESHOLD) {
+      {
+          var forearm_length = Math.sqrt(Math.abs(pose.keypoints[shoulder_index].position.y - pose.keypoints[elbow_index].position.y) ** 2 + Math.abs(
+            pose.keypoints[shoulder_index].position.x - pose.keypoints[elbow_index].position.x) ** 2);
+          var bicep_length = Math.sqrt(Math.abs(pose.keypoints[elbow_index].position.y - pose.keypoints[wrist_index].position.y) ** 2 + Math.abs(
+            pose.keypoints[elbow_index].position.x - pose.keypoints[wrist_index].position.x) ** 2);
+          var exterior_length = Math.sqrt(Math.abs(pose.keypoints[shoulder_index].position.y - pose.keypoints[wrist_index].position.y) ** 2 + Math.abs(
+            pose.keypoints[shoulder_index].position.x - pose.keypoints[wrist_index].position.x) ** 2);
+          var angle = Math.acos((forearm_length ** 2 + bicep_length ** 2 - exterior_length ** 2) / (
+            2 * forearm_length * bicep_length));
+          angle = angle * (180 / Math.PI)    
+          console.log(angle)
+          if (angle < ANGLE_THRESHOLD && pose.keypoints[shoulder_index].position.y < pose.keypoints[wrist_index].position.y && pose.keypoints[elbow_index].position.y < pose.keypoints[wrist_index].position.y)
+          {
+            valid = true
+          }
+          console.log(angle, STRAIGHTEN_THRESHOLD)
+          if (angle > STRAIGHTEN_THRESHOLD)
+          {
+            this.pushup_allowed = true
+          }
+        }
     }
-    valuesAndIndices.sort((a, b) => {
-      return b.value - a.value;
-    });
-    const topkValues = new Float32Array(topK);
-    const topkIndices = new Int32Array(topK);
-    for (let i = 0; i < topK; i++) {
-      topkValues[i] = valuesAndIndices[i].value;
-      topkIndices[i] = valuesAndIndices[i].index;
-    }
-
-    const topClassesAndProbs = [];
-    for (let i = 0; i < topkIndices.length; i++) {
-      topClassesAndProbs.push({
-        className: MODEL_CLASSES[topkIndices[i]],
-        probability: (topkValues[i] * 100).toFixed(2)
-      });
-    }
-    return topClassesAndProbs;
+    console.log(valid, this.pushup_allowed)
+    return valid
   }
 
   handlePanelClick = event => {
@@ -290,10 +306,6 @@ export default class Classify extends Component {
     switch(activeKey) {
       case 'camera':
         this.startWebcam();
-        break;
-      case 'localfile':
-        this.setState({filename: null, file: null});
-        this.stopWebcam();
         break;
       default:
     }
@@ -320,7 +332,7 @@ export default class Classify extends Component {
           aria-controls="photo-selection-pane"
           aria-expanded={this.state.photoSettingsOpen}
           >
-          Take or Select a Photo to Classify
+          Pushup Counter
             <span className='panel-arrow'>
             { this.state.photoSettingsOpen
               ? <FaChevronDown />
@@ -368,7 +380,7 @@ export default class Classify extends Component {
               }
             <Tabs defaultActiveKey="camera" id="input-options" onSelect={this.handleTabSelect}
                   className="justify-content-center">
-              <Tab eventKey="camera" title="Take Photo">
+              <Tab eventKey="camera" title="Camera">
                 <div id="no-webcam" ref="noWebcam">
                   <span className="camera-icon"><FaCamera /></span>
                   No camera found. <br />
@@ -387,67 +399,20 @@ export default class Classify extends Component {
                     size="lg"
                     onClick={this.classifyWebcamImage}
                     isLoading={this.state.isClassifying}
-                    text="Classify"
-                    loadingText="Classifying..."
+                    text="Begin Counting"
+                    loadingText= 'Begin Exercise'
                   />
                 </div>
-              </Tab>
-              <Tab eventKey="localfile" title="Select Local File">
-                <Form.Group controlId="file">
-                  <Form.Label>Select Image File</Form.Label><br />
-                  <Form.Label className="imagelabel">
-                    {this.state.filename ? this.state.filename : 'Browse...'}
-                  </Form.Label>
-                  <Form.Control
-                    onChange={this.handleFileChange}
-                    type="file"
-                    accept="image/*"
-                    className="imagefile" />
-                </Form.Group>
-                { this.state.file &&
-                  <Fragment>
-                    <div id="local-image">
-                      <Cropper
-                        ref="cropper"
-                        src={this.state.file}
-                        style={{height: 400, width: '100%'}}
-                        guides={true}
-                        aspectRatio={1 / 1}
-                        viewMode={2}
-                      />
-                    </div>
-                    <div className="button-container">
-                      <LoadButton
-                        variant="primary"
-                        size="lg"
-                        disabled={!this.state.filename}
-                        onClick={this.classifyLocalImage}
-                        isLoading={this.state.isClassifying}
-                        text="Classify"
-                        loadingText="Classifying..."
-                      />
-                    </div>
-                  </Fragment>
-                }
+                <div id="timer" hidden>
+                </div>
+                <div id="pushup_count" hidden>
+                </div>
+                <div id="straighten_arm"  hidden>Straighten Your Arm
+                </div>
               </Tab>
             </Tabs>
             </div>
           </Collapse>
-          { this.state.predictions.length > 0 &&
-            <div className="classification-results">
-              <h3>Predictions</h3>
-              <canvas ref="canvas" width={CANVAS_SIZE} height={CANVAS_SIZE} />
-              <br />
-              <ListGroup>
-              {this.state.predictions.map((category) => {
-                  return (
-                    <ListGroup.Item key={category.className}>
-                      <strong>{category.className}</strong> {category.probability}%</ListGroup.Item>
-                  );
-              })}
-              </ListGroup>
-            </div>
-          }
           </Fragment>
         }
       </div>
